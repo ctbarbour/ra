@@ -287,7 +287,7 @@ handle_leader({command, Cmd}, State00 = #{id := Id}) ->
                     written ->
                         % fake written event
                         {State0,
-                         [{next_event, {ra_log_event, {written, {Idx, Idx, Term}}}}]};
+                         [{next_event, cast, {ra_log_event, {written, {Idx, Idx, Term}}}}]};
                     queued ->
                         {State0, []}
                 end,
