@@ -16,6 +16,7 @@ all() ->
 all_tests() ->
     [
      ra_fifo_client_basics,
+     ra_fifo_client_handles_reject_notification,
      leader_monitors_customer,
      follower_takes_over_monitor,
      node_is_deleted,
@@ -64,7 +65,7 @@ ra_fifo_client_basics(Config) ->
     _ = ra:start_node(Conf),
     ok = ra:trigger_election(NodeId),
     FState0 = ra_fifo_client:init([NodeId]),
-    {ok, FState1} = ra_fifo_client:checkout(CustomerTag, 10, FState0),
+    {ok, FState1} = ra_fifo_client:checkout(CustomerTag, 1, FState0),
     % _ = ra:send_and_await_consensus(NodeId, {checkout, {auto, 10}, Cid}),
 
     ra_log_wal:force_roll_over(ra_log_wal),
@@ -76,8 +77,8 @@ ra_fifo_client_basics(Config) ->
     FState3 = process_ra_event(FState2, 250),
 
     FState5 = receive
-                  {ra_event, Evt} ->
-                      case ra_fifo_client:handle_ra_event(Evt, FState3) of
+                  {ra_event, From, Evt} ->
+                      case ra_fifo_client:handle_ra_event(From, Evt, FState3) of
                           {internal, _AcceptedSeqs, _FState4} ->
                               exit(unexpected_internal_event);
                           {{delivery, C, [{MsgId, _Msg}]}, FState4} ->
@@ -99,22 +100,46 @@ ra_fifo_client_basics(Config) ->
     {ok, _, FState6} = ra_fifo_client:enqueue(two, FState5b),
     % process applied event
     FState6b = process_ra_event(FState6, 250),
-    % _ = ra:send_and_await_consensus(NodeId, {enqueue, two}),
+
     receive
-        {ra_event, E} ->
-            case ra_fifo_client:handle_ra_event(E, FState6b) of
+        {ra_event, Frm, E} ->
+            case ra_fifo_client:handle_ra_event(Frm, E, FState6b) of
                 {internal, _, _FState7} ->
                     ct:pal("unexpected event ~p~n", [E]),
                     exit({unexpected_internal_event, E});
                 {{delivery, Ctag, [{Mid, {_, two}}]}, FState7} ->
-                    {ok, _, _S} = ra_fifo_client:return(Ctag, [Mid],
-                                                        FState7),
+                    {ok, _, _S} = ra_fifo_client:return(Ctag, [Mid], FState7),
                     ok
             end
     after 2000 ->
               exit(await_msg_timeout)
     end,
     ra:stop_node(NodeId),
+    ok.
+
+ra_fifo_client_handles_reject_notification(Config) ->
+    PrivDir = ?config(priv_dir, Config),
+    NodeId1 = ?config(node_id, Config),
+    NodeId2 = ?config(node_id2, Config),
+    UId1 = ?config(uid, Config),
+    CId = {UId1, self()},
+    UId2 = ?config(uid2, Config),
+    Conf1 = conf(UId1, NodeId1, PrivDir, [NodeId1, NodeId2]),
+    Conf2 = conf(UId2, NodeId2, PrivDir, [NodeId1, NodeId2]),
+    _ = ra:start_node(Conf1),
+    _ = ra:start_node(Conf2),
+    ok = ra:trigger_election(NodeId1),
+    _ = ra:send_and_await_consensus(NodeId1, {checkout, {auto, 10}, CId}),
+    % reverse order - should try the first node in the list first
+    F0 = ra_fifo_client:init([NodeId2, NodeId1]),
+    {ok, _Seq, F1} = ra_fifo_client:enqueue(one, F0),
+
+    timer:sleep(500),
+
+    % the applied notification
+    _F2 = process_ra_event(F1, 250),
+    ra:stop_node(NodeId1),
+    ra:stop_node(NodeId2),
     ok.
 
 leader_monitors_customer(Config) ->
@@ -199,7 +224,7 @@ node_is_deleted(Config) ->
     {ok, _, _} = ra:send_and_await_consensus(NodeId,
                                              {checkout, {auto, 10}, CId}),
     receive
-        {ra_fifo, _, Evt} ->
+        {ra_event, _, Evt} ->
             exit({unexpected_machine_event, Evt})
     after 500 -> ok
     end,
@@ -247,7 +272,7 @@ restarted_node_does_not_reissue_side_effects(Config) ->
     {ok, _, _} = ra:send_and_await_consensus(NodeId, {checkout, {auto, 10}, CId}),
     {ok, _, _} = ra:send_and_await_consensus(NodeId, {enqueue, msg1}),
     receive
-        {ra_event, {machine, _, {delivery, C, [{MsgId, _}]}}} ->
+        {ra_event, _, {machine, {delivery, C, [{MsgId, _}]}}} ->
             {ok, _, _} = ra:send_and_await_consensus(NodeId, {settle, MsgId, C})
     after 2000 ->
               exit(ra_fifo_event_timeout)
@@ -259,7 +284,7 @@ restarted_node_does_not_reissue_side_effects(Config) ->
 
     %  check message isn't received again
     receive
-        {ra_event, {machine, _, {delivery, _, _}}} ->
+        {ra_event, _, {machine, {delivery, _, _}}} ->
             exit(unexpected_ra_fifo_event)
     after 1000 ->
               ok
@@ -325,9 +350,9 @@ conf(UId, NodeId, Dir, Peers) ->
 
 process_ra_event(State, Wait) ->
     receive
-        {ra_event, Evt} ->
+        {ra_event, From, Evt} ->
             ct:pal("processed ra event ~p~n", [Evt]),
-            {internal, _, S} = ra_fifo_client:handle_ra_event(Evt, State),
+            {internal, _, S} = ra_fifo_client:handle_ra_event(From, Evt, State),
             S
     after Wait ->
               exit(ra_event_timeout)
@@ -335,8 +360,8 @@ process_ra_event(State, Wait) ->
 
 process_ra_events(State0, Wait) ->
     receive
-        {ra_event, Evt} ->
-            {internal, _, State} = ra_fifo_client:handle_ra_event(Evt, State0),
+        {ra_event, From, Evt} ->
+            {internal, _, State} = ra_fifo_client:handle_ra_event(From, Evt, State0),
             process_ra_event(State, Wait)
     after Wait ->
               State0
